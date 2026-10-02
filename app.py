@@ -1,120 +1,129 @@
-from langchain_google_genai import ChatGoogleGenerativeAI
+from flask import Flask, render_template, request, jsonify
+from flask_cors import CORS
 from src.helper import download_hugging_face_embeddings
+from langchain_pinecone import PineconeVectorStore
+from langchain_cohere import ChatCohere
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
-
 from langchain_core.prompts import ChatPromptTemplate
-import os
-from langchain_pinecone import PineconeVectorStore
-from src.prompt import *
 from dotenv import load_dotenv
-from flask import Flask, request, jsonify, render_template
-from langchain.chains import RefineDocumentsChain
-from langchain.chains.llm import LLMChain
-from langchain.prompts import PromptTemplate
+import os
+from functools import lru_cache
 
+# Initialize Flask app
 app = Flask(__name__)
+CORS(app)
+
+# Load environment variables
 load_dotenv()
-
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-GEMENIE_API_KEY = os.getenv("GOOGLE_API_KEY")
+COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 
-os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
-os.environ["GEMENIE_API_KEY"] = GEMENIE_API_KEY
 
-# -----------------------------
-# Load embeddings
-# -----------------------------
-embeddings = download_hugging_face_embeddings()
+# Cohere LLM helper
+def get_cohere_llm(temperature=0.4, max_tokens=500):
+    """Return a Cohere LLM instance."""
+    return ChatCohere(
+        model="command-xlarge-nightly",  # Choose available Cohere model
+        cohere_api_key=COHERE_API_KEY,
+        temperature=temperature,
+        max_tokens=max_tokens
+    )
 
-# -----------------------------
-# Connect to existing Pinecone index
-# -----------------------------
-index_name = "agriculture-chatbot"
 
-docsearch = PineconeVectorStore.from_existing_index(
-    index_name=index_name,
-    embedding=embeddings
+# Translation helper using Cohere LLM
+def translate_to_english(text, llm):
+    translation_prompt = (
+        f"Translate the following text into English. "
+        f"Do not explain, just return translation, and if it is already in English, return the same text:\n\n{text}"
+    )
+    result = llm.invoke(translation_prompt)
+    return result.content
+
+
+# Prompt template
+prompt_template = (
+    "You are a helpful and empathetic medical assistant.\n\n"
+    "Here is some reference information from our knowledge base:\n"
+    "{context}\n\n"
+    "User's question: {original_input}\n\n"
+    "Chat history: {chat_history}\n\n"
+    "If the context contains relevant medical info, use it naturally in your reply.\n"
+    "If the context does not help, respond politely that the information is not available in the knowledge base.\n"
+    "Strictly use context for generating response if the information is not available in context then respond politely that the information is not available in the knowledge base.\n"
+    "Use the chat history to maintain continuity and remember what has already been discussed and based on that give the user reply according to the context.\n"
+    "You may also ask the user gentle follow-up questions if you need more details about their situation in order to give a better and safer response.\n"
+    "Always reply in the same language as the user's original question ({original_input}).\n"
+    "Always sound natural, supportive, and strictly use context without making it obvious you are using context for generating response."
 )
-
-retriever = docsearch.as_retriever(
-    search_type="similarity",
-    search_kwargs={"k": 3}
-)
-
-# -----------------------------
-# LLM and Prompt Setup
-# -----------------------------
-llm = ChatGoogleGenerativeAI(
-    model="gemini-1.5-flash",
-    temperature=0.4,
-    max_output_tokens=500,
-    google_api_key=GEMENIE_API_KEY
-)
-
-prompt = ChatPromptTemplate.from_messages(
-    [
-        prompt_template,
-    ]
-)
-
-# Prompt for the first chunk
-document_prompt = PromptTemplate(
-    input_variables=["page_content"],
-    template=prompt_template
-)
-
-# Prompt for refining subsequent chunks
-refine_prompt = PromptTemplate(
-    input_variables=["document", "prev_response"],
-    template="Refine the following answer based on this new document:\n\n{document}\n\nPrevious Answer: {prev_response}"
-)
-
-question_answer_chain = create_stuff_documents_chain(llm=llm, prompt=document_prompt)
+prompt = ChatPromptTemplate.from_template(prompt_template)
 
 
-# Create RAG chain
-rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+@lru_cache(maxsize=1)
+def get_rag_chain():
+    """Load all components lazily, cache after first run"""
+    embeddings = download_hugging_face_embeddings()
 
-# -----------------------------
-# Helper function for greetings / short input
-# -----------------------------
-def handle_greetings_or_small_input(user_input):
-    greetings = ["hi", "hello", "hey", "good morning", "good evening"]
-    user_input_lower = user_input.strip().lower()
+    docsearch = PineconeVectorStore.from_existing_index(
+        index_name="medicalbot",
+        embedding=embeddings
+    )
+    retriever = docsearch.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": 10}
+    )
 
-    if user_input_lower in greetings:
-        return "Hello! How can I help you with agriculture today?"
-    
-    if len(user_input.strip()) < 3:  # very short inputs
-        return "Could you please provide more details so I can help you better?"
+    llm = get_cohere_llm()
+    question_answer_chain = create_stuff_documents_chain(llm, prompt)
+    rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+    return rag_chain
 
-    return None  # go through RAG if input is normal
 
-# -----------------------------
-# Flask Routes
-# -----------------------------
 @app.route("/")
 def index():
     return render_template("chat.html")
 
-@app.route("/get", methods=["GET", "POST"])
+
+@app.route("/get", methods=["POST"])
 def chat():
-    msg = request.form.get("msg", "").strip()
-    print(f"User input: {msg}")
+    try:
+        data = request.get_json()
+        if not data or "msg" not in data:
+            return jsonify({"error": "Invalid request"}), 400
 
-    # Step 1: Check for greetings or very short/unrelated input
-    pre_response = handle_greetings_or_small_input(msg)
-    if pre_response:
-        print(f"Bot response (greeting/small input): {pre_response}")
-        return pre_response
+        user_message = data["msg"]
+        chat_history = data.get("chat_history", [])
 
-    # Step 2: Otherwise, go through RAG chain
-    response = rag_chain.invoke({"input": msg})
-    answer = response.get("answer", "Sorry, I couldn't find an answer for that.")
-    print(f"Bot response: {answer}")
+        rag_chain = get_rag_chain()
 
-    return str(answer)
+        # Translate user_message → English for retrieval
+        llm_translate = get_cohere_llm(temperature=0.2, max_tokens=200)
+        translated_query = translate_to_english(user_message, llm_translate)
+
+        print("Translated query:", translated_query)
+        print("Chat History:", chat_history)
+
+        response = rag_chain.invoke({
+            "input": translated_query,
+            "original_input": user_message,
+            "chat_history": chat_history
+        })
+
+        print("RAG Response:", response)
+        final_answer = response.get("answer", "No answer generated")
+        print("Final Answer:", final_answer)
+
+        return jsonify({"answer": final_answer})
+
+    except Exception as e:
+        print(f"Error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/health")
+def health():
+    return "OK", 200
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=True)
+    app.run(host="0.0.0.0", port=8080)
